@@ -2031,163 +2031,165 @@
       // ----- Drip Simulator Engine (no drip below 100) -----
      function simulateDripsWithNewEngine(target, minV, maxV, intervalMin, vibe, smartBoost, speedMultiplier = 1, finishHours = null) {
     const HARD_FLOOR = 100;
-    // Cap each drip to at most 30% of target – prevents any single huge drip
-    const MAX_SINGLE_FRAC = 0.3;
-    let effectiveMax = Math.min(maxV, Math.floor(target * MAX_SINGLE_FRAC));
-    effectiveMax = Math.max(effectiveMax, HARD_FLOOR);
-    const effectiveMin = Math.max(HARD_FLOOR, minV);
-    
+    minV = Math.max(HARD_FLOOR, minV);
+
+    // ----- AUTO-SET MAX VIEWS IF MISSING OR NEGATIVE -----
+    let effectiveMax = maxV;
+    if (!effectiveMax || effectiveMax <= 0) {
+        if (finishHours && finishHours > 0) {
+            const approxDrips = Math.max(4, Math.floor((finishHours * 60) / intervalMin));
+            effectiveMax = Math.floor(target / approxDrips * 1.8);
+        } else {
+            effectiveMax = Math.min(Math.max(300, Math.floor(target * 0.12)), Math.floor(target * 0.35));
+        }
+        effectiveMax = Math.max(effectiveMax, minV + 50);
+    }
+    effectiveMax = Math.min(effectiveMax, Math.floor(target * 0.35));
+    effectiveMax = Math.max(effectiveMax, minV);
+
     let current = 0;
     let drips = [];
 
-    // ------------------------------------------------------------------
-    // 1) FINISH DEADLINE MODE (e.g. "Finish In 3 hours")
-    // ------------------------------------------------------------------
+    // ------------------- DEADLINE MODE -------------------
     if (finishHours && finishHours > 0) {
         const totalMinutes = finishHours * 60;
-        // How many drips can we fit with given interval?
         let maxDrips = Math.floor(totalMinutes / intervalMin);
-        // Minimum 2 drips, maximum reasonable number (avoid 1000s of drips)
-        maxDrips = Math.min(60, Math.max(2, maxDrips));
-        
-        // Build an S‑curve cumulative distribution of views over the drips
-        const steepness = 8.0;  // makes the curve smooth
+        maxDrips = Math.min(60, Math.max(4, maxDrips));
+
         const cumTargets = [];
+        const steepness = 8.0;
         for (let i = 0; i <= maxDrips; i++) {
-            const t = i / maxDrips;  // 0 → 1
-            // logistic centred at 0.5
+            const t = i / maxDrips;
             const sig = 1 / (1 + Math.exp(-steepness * (t - 0.5)));
             cumTargets.push(sig * target);
         }
-        
-        // Generate drips from the S‑curve differences
+
         for (let i = 0; i < maxDrips && current < target; i++) {
             let remaining = target - current;
             if (remaining <= 0) break;
+
+            let raw = cumTargets[i + 1] - cumTargets[i];
             
-            let raw = cumTargets[i+1] - cumTargets[i];
-            // Clamp to min/max and the individual cap
-            raw = Math.max(effectiveMin, Math.min(effectiveMax, raw));
-            // Add natural randomness (±20%)
-            raw = Math.round(raw * (0.8 + Math.random() * 0.4));
-            raw = Math.max(effectiveMin, Math.min(effectiveMax, raw));
+            const progress = current / target;
+            let vibeFactor = 1;
+            if (vibe === 'smooth-s-curve') vibeFactor = 1;
+            else if (vibe === 'meteor-shower') vibeFactor = (progress < 0.3 || progress > 0.7) ? 0.6 : 1.4;
+            else if (vibe === 'flash-flood') vibeFactor = progress < 0.3 ? 1.5 : (progress < 0.7 ? 1.0 : 0.6);
+            else if (vibe === 'sunrise-curve') vibeFactor = 0.7 + progress * 0.8;
+            else if (vibe === 'burst-pause-burst') vibeFactor = (Math.abs(progress - 0.15) < 0.1 || Math.abs(progress - 0.4) < 0.1 || Math.abs(progress - 0.65) < 0.1 || Math.abs(progress - 0.9) < 0.1) ? 1.4 : 0.5;
+            else if (vibe === 'bimodal') vibeFactor = Math.floor(progress * 10) % 2 === 0 ? 0.5 : 1.5;
+            
+            raw = raw * vibeFactor;
+            raw = Math.max(minV, Math.min(effectiveMax, Math.round(raw)));
             if (raw > remaining) raw = remaining;
-            
+
             current += raw;
             drips.push({
-                number: i+1,
+                number: i + 1,
                 views: raw,
                 cumulative: current,
-                waitMinutes: intervalMin   // fixed interval in deadline mode
+                waitMinutes: intervalMin
             });
         }
-        
-        // If we didn't reach target (rare), add the remainder as a final drip (capped)
+
         if (current < target) {
-            let last = Math.min(target - current, effectiveMax);
-            last = Math.max(effectiveMin, last);
             drips.push({
-                number: drips.length+1,
-                views: last,
+                number: drips.length + 1,
+                views: target - current,
                 cumulative: target,
                 waitMinutes: intervalMin
             });
         }
     }
     
-    // ------------------------------------------------------------------
-    // 2) NATURAL MODE (no deadline) – intelligent gradual progression
-    // ------------------------------------------------------------------
+    // ------------------- NATURAL MODE (NO DEADLINE) -------------------
     else {
-        // sizeBias: higher speedMultiplier → larger drips overall
-        let sizeBias = 1 + (speedMultiplier - 1) * 0.8;
         let remaining = target;
-        
-        // Helper: get a scale factor (0..1) for current progress depending on vibe
+        let i = 0;
+        const MAX_DRIPS = 150;
+
         function getScale(progress, vibe) {
-            switch(vibe) {
+            switch (vibe) {
                 case 'smooth-s-curve':
-                    // slow start, acceleration, then plateau
-                    return 1 / (1 + Math.exp(-10 * (progress - 0.5)));
+                    const sig = 1 / (1 + Math.exp(-10 * (progress - 0.5)));
+                    return Math.pow(sig, 1.2);
                 case 'meteor-shower':
-                    return Math.random() < 0.2 ? 0.9 : Math.random() * 0.3;
+                    return progress < 0.3 ? 0.2 : (progress < 0.7 ? 1.0 : 0.4);
                 case 'flash-flood':
-                    if (progress < 0.3) return 0.7 + Math.random()*0.3;
-                    if (progress < 0.7) return 0.3 + Math.random()*0.4;
-                    return 0.1 + Math.random()*0.2;
+                    if (progress < 0.3) return 0.9;
+                    if (progress < 0.7) return 0.6;
+                    return 0.3;
                 case 'sunrise-curve':
                     const peak = 0.6;
-                    if (progress <= peak) return (progress/peak)*0.8 + 0.1;
-                    return ((1-progress)/(1-peak))*0.8 + 0.1;
+                    if (progress <= peak) return Math.pow(progress / peak, 1.5) * 0.9;
+                    return Math.pow((1 - progress) / (1 - peak), 1.2) * 0.9;
                 case 'burst-pause-burst': {
-                    const centers = [0.15,0.4,0.65,0.9];
-                    const nearest = Math.min(...centers.map(c=>Math.abs(progress-c)));
-                    return nearest < 0.1 ? 0.8+Math.random()*0.2 : 0.05+Math.random()*0.1;
+                    const centers = [0.15, 0.4, 0.65, 0.9];
+                    let nearest = 1;
+                    for (let c of centers) nearest = Math.min(nearest, Math.abs(progress - c));
+                    return nearest < 0.1 ? 0.95 : 0.2;
                 }
                 case 'bimodal':
-                    return Math.random() < 0.5 ? 0.05+Math.random()*0.15 : 0.85+Math.random()*0.15;
+                    return Math.floor(progress * 10) % 2 === 0 ? 0.25 : 0.9;
                 default:
                     return progress;
             }
         }
-        
-        let i = 0;
-        const MAX_DRIPS = 150;
+
         while (remaining > 0 && i < MAX_DRIPS) {
             const progress = (target - remaining) / target;
             let scale = getScale(progress, vibe);
-            // scale now between 0 and 1; multiply by effectiveMax to get view count
-            let views = effectiveMin + (effectiveMax - effectiveMin) * Math.min(1, scale * sizeBias);
-            // add natural noise
-            views = Math.round(views * (0.8 + Math.random() * 0.4));
-            views = Math.min(effectiveMax, Math.max(effectiveMin, views));
-            if (views > remaining) views = remaining;
             
+            scale = Math.min(1, scale * (1 + (speedMultiplier - 1) * 0.6));
+            
+            // KEY FIX: Aggressive curve for natural growth (120 → 180 → 250 → 400)
+            let views = minV + (effectiveMax - minV) * Math.pow(scale, 0.7);
+            views = Math.round(views);
+            views = Math.min(effectiveMax, Math.max(minV, views));
+            
+            if (views > remaining) views = remaining;
+            if (views < minV && remaining >= minV) views = Math.min(remaining, minV);
+
             remaining -= views;
             const cumulative = target - remaining;
-            
-            // Wait time: base interval ±15% and vibe adjustments
+
             let wait = intervalMin;
-            wait *= (0.85 + Math.random() * 0.3);
-            if (vibe === 'meteor-shower') wait *= (Math.random() < 0.3 ? 1.5 : 0.7);
-            if (vibe === 'burst-pause-burst') wait *= (Math.random() < 0.4 ? 1.8 : 0.5);
-            wait = Math.max(1, Math.min(120, Math.round(wait)));
-            
+            if (vibe === 'meteor-shower') wait = Math.round(wait * (progress < 0.3 ? 1.6 : 0.8));
+            if (vibe === 'burst-pause-burst') {
+                const isBurst = (Math.abs(progress - 0.15) < 0.1 || Math.abs(progress - 0.4) < 0.1 || Math.abs(progress - 0.65) < 0.1 || Math.abs(progress - 0.9) < 0.1);
+                wait = Math.round(wait * (isBurst ? 0.5 : 1.8));
+            }
+            wait = Math.max(1, Math.min(120, wait));
+
             drips.push({
-                number: i+1,
+                number: i + 1,
                 views: views,
                 cumulative: cumulative,
                 waitMinutes: wait
             });
             i++;
-            
-            // Smart boost (extra random drip)
-            if (smartBoost && remaining > 300 && Math.random() < 0.04) {
-                let boost = Math.round(views * (0.3 + Math.random() * 0.5));
+
+            if (smartBoost && remaining > 300 && i % 5 === 0) {
+                let boost = Math.round(views * 0.5);
                 boost = Math.min(boost, remaining);
-                if (boost >= effectiveMin) {
+                if (boost >= minV) {
                     remaining -= boost;
-                    const boostCum = target - remaining;
                     drips.push({
-                        number: drips.length+1,
+                        number: drips.length + 1,
                         views: boost,
-                        cumulative: boostCum,
+                        cumulative: target - remaining,
                         waitMinutes: 0
                     });
                 }
             }
         }
     }
-    
-    // ------------------------------------------------------------------
-    // 3) FINAL SAFETY: ensure no drip is below 100 (redistribute)
-    // ------------------------------------------------------------------
-    let modified = false;
+
+    // ------------------- ENSURE NO DRIP UNDER 100 -------------------
     for (let i = 0; i < drips.length; i++) {
-        if (drips[i].views < 100) {
+        if (drips[i].views < 100 && i < drips.length - 1) {
             let deficit = 100 - drips[i].views;
-            // take from later drips that have extra above 100
-            for (let j = i+1; j < drips.length; j++) {
+            for (let j = i + 1; j < drips.length; j++) {
                 if (drips[j].views > 100) {
                     let take = Math.min(deficit, drips[j].views - 100);
                     drips[i].views += take;
@@ -2196,33 +2198,15 @@
                     if (deficit <= 0) break;
                 }
             }
-            // if still deficit, increase the last drip a bit (max 5% of target)
-            if (deficit > 0) {
-                const maxExtra = Math.floor(target * 0.05);
-                if (deficit <= maxExtra) {
-                    drips[drips.length-1].views += deficit;
-                    drips[drips.length-1].cumulative += deficit;
-                    let cum = 0;
-                    for (let k=0; k<drips.length; k++) {
-                        cum += drips[k].views;
-                        drips[k].cumulative = cum;
-                    }
-                    modified = true;
-                } else {
-                    drips[i].views = 100;
-                }
-            }
-            modified = true;
-        }
-    }
-    if (modified) {
-        let cum = 0;
-        for (let i=0; i<drips.length; i++) {
-            cum += drips[i].views;
-            drips[i].cumulative = cum;
         }
     }
     
+    let cum = 0;
+    for (let i = 0; i < drips.length; i++) {
+        cum += drips[i].views;
+        drips[i].cumulative = cum;
+    }
+
     return drips;
 }
       function updatePreview() {
@@ -2627,22 +2611,29 @@
         if (!timerInterval) timerInterval = setInterval(updateTimers, 1000);
         updateTimers();
       }
-      function updateTimers() {
-        const now = Date.now() / 1000;
-        for (const [id, c] of Object.entries(campaigns)) {
-          const el = document.getElementById(`timer-${id}`);
-          if (!el) continue;
-          const next = c.next_drip || 0;
-          if (c.status === "active") {
-            if (next > now) {
-              const diff = Math.max(0, Math.floor(next - now));
-              const mins = Math.floor(diff / 60),
-                secs = diff % 60;
-              el.textContent = `${mins}m ${secs}s`;
-            } else el.textContent = c.last_order_id ? "Processing…" : "Sending…";
-          } else el.textContent = "—";
-        }
-        updateGlobalNext();
+     function updateTimers() {
+  const now = Date.now() / 1000;
+  for (const [id, c] of Object.entries(campaigns)) {
+    const el = document.getElementById(`timer-${id}`);
+    if (!el) continue;
+    const next = c.next_drip || 0;
+    if (c.status === "active") {
+      // If there is a pending order, we still show the countdown if next_drip > now
+      if (next > now) {
+        const diff = Math.max(0, Math.floor(next - now));
+        const mins = Math.floor(diff / 60), secs = diff % 60;
+        el.textContent = `${mins}m ${secs}s`;
+      } else if (c.last_order_id) {
+        el.textContent = "Processing…";
+      } else {
+        el.textContent = "Sending…";
+      }
+    } else {
+      el.textContent = "—";
+    }
+  }
+  updateGlobalNext();
+
       }
       function updateGlobalNext() {
         const now = Date.now() / 1000;
